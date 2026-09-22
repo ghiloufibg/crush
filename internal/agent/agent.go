@@ -141,6 +141,7 @@ type SessionAgent interface {
 	Cancel(sessionID string)
 	CancelAll()
 	IsSessionBusy(sessionID string) bool
+	SessionHasWork(sessionID string) bool
 	IsBusy() bool
 	QueuedPrompts(sessionID string) int
 	QueuedPromptsList(sessionID string) []string
@@ -2069,9 +2070,26 @@ func (a *sessionAgent) IsBusy() bool {
 	return busy
 }
 
+// IsSessionBusy reports whether a turn is already running for sessionID.
+// It deliberately ignores accepted-but-unstarted runs: Run and Summarize
+// use it to decide whether to queue behind an existing turn, and a caller
+// holding its own accept reservation would otherwise queue behind itself.
+// Observers asking whether a session is safe to touch want SessionHasWork.
 func (a *sessionAgent) IsSessionBusy(sessionID string) bool {
 	_, busy := a.activeRequests.Get(sessionID)
 	return busy
+}
+
+// SessionHasWork reports whether a run for sessionID is active or has been
+// accepted but not yet started. A prompt is accepted before it registers as
+// active, so anything deciding whether a session may be modified has to
+// treat that window as live work.
+func (a *sessionAgent) SessionHasWork(sessionID string) bool {
+	if a.IsSessionBusy(sessionID) {
+		return true
+	}
+	accepted, _ := a.acceptedRuns.Get(sessionID)
+	return accepted > 0
 }
 
 func (a *sessionAgent) QueuedPrompts(sessionID string) int {

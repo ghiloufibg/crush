@@ -1392,8 +1392,36 @@ func (c *coordinator) IsBusy() bool {
 	return c.currentAgent().IsBusy()
 }
 
+// IsSessionBusy reports whether work is in flight for sessionID.
+//
+// This is the observers' question: may this session be modified? It counts
+// a run accepted but not yet started, and resolves a sub-agent's session
+// through its parent. A sub-agent runs in its own session against its own
+// agent instance, so asking the main agent about a sub-session directly
+// always answers no; the run holding it is the parent's, so a sub-session
+// is busy exactly when its parent is.
 func (c *coordinator) IsSessionBusy(sessionID string) bool {
-	return c.currentAgent().IsSessionBusy(sessionID)
+	if c.currentAgent().SessionHasWork(sessionID) {
+		return true
+	}
+	parentID, err := c.parentSessionID(sessionID)
+	if err != nil || parentID == "" {
+		return false
+	}
+	return c.currentAgent().SessionHasWork(parentID)
+}
+
+// parentSessionID returns the session that owns sessionID, or empty when it
+// is a top-level session.
+func (c *coordinator) parentSessionID(sessionID string) (string, error) {
+	if c.sessions == nil {
+		return "", nil
+	}
+	sess, err := c.sessions.Get(context.Background(), sessionID)
+	if err != nil {
+		return "", err
+	}
+	return sess.ParentSessionID, nil
 }
 
 func (c *coordinator) Model() Model {
