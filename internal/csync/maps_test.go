@@ -17,7 +17,7 @@ func TestNewMap(t *testing.T) {
 
 	m := NewMap[string, int]()
 	require.NotNil(t, m)
-	require.NotNil(t, m.inner)
+	require.NotNil(t, m.state.inner)
 	require.Equal(t, 0, m.Len())
 }
 
@@ -31,7 +31,7 @@ func TestNewMapFrom(t *testing.T) {
 
 	m := NewMapFrom(original)
 	require.NotNil(t, m)
-	require.Equal(t, original, m.inner)
+	require.Equal(t, original, m.state.inner)
 	require.Equal(t, 2, m.Len())
 
 	value, ok := m.Get("key1")

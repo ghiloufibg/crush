@@ -7,57 +7,65 @@ import (
 	"sync"
 )
 
-// Map is a concurrent map implementation that provides thread-safe access.
-type Map[K comparable, V any] struct {
+// mapState holds the mutex and the backing map. It is indirected behind a
+// pointer so that Map itself never embeds a sync.Locker by value, which lets
+// JSONSchemaAlias below use a value receiver (required by
+// invopop/jsonschema) without go vet flagging it as copying a lock.
+type mapState[K comparable, V any] struct {
 	inner map[K]V
 	mu    sync.RWMutex
+}
+
+// Map is a concurrent map implementation that provides thread-safe access.
+type Map[K comparable, V any] struct {
+	state *mapState[K, V]
 }
 
 // NewMap creates a new thread-safe map with the specified key and value types.
 func NewMap[K comparable, V any]() *Map[K, V] {
 	return &Map[K, V]{
-		inner: make(map[K]V),
+		state: &mapState[K, V]{inner: make(map[K]V)},
 	}
 }
 
 // NewMapFrom creates a new thread-safe map from an existing map.
 func NewMapFrom[K comparable, V any](m map[K]V) *Map[K, V] {
 	return &Map[K, V]{
-		inner: m,
+		state: &mapState[K, V]{inner: m},
 	}
 }
 
 // NewLazyMap creates a new lazy-loaded map. The provided load function is
 // executed in a separate goroutine to populate the map.
 func NewLazyMap[K comparable, V any](load func() map[K]V) *Map[K, V] {
-	m := &Map[K, V]{}
-	m.mu.Lock()
+	m := &Map[K, V]{state: &mapState[K, V]{}}
+	m.state.mu.Lock()
 	go func() {
-		defer m.mu.Unlock()
-		m.inner = load()
+		defer m.state.mu.Unlock()
+		m.state.inner = load()
 	}()
 	return m
 }
 
 // Reset replaces the inner map with the new one.
 func (m *Map[K, V]) Reset(input map[K]V) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.inner = input
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	m.state.inner = input
 }
 
 // Set sets the value for the specified key in the map.
 func (m *Map[K, V]) Set(key K, value V) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.inner[key] = value
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	m.state.inner[key] = value
 }
 
 // Del deletes the specified key from the map.
 func (m *Map[K, V]) Del(key K) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.inner, key)
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	delete(m.state.inner, key)
 }
 
 // CompareAndDelete deletes the key only if the current value matches the
@@ -66,32 +74,32 @@ func (m *Map[K, V]) Del(key K) {
 // a value that was replaced by a newer writer in the window between the
 // explicit Del and the deferred Del.
 func (m *Map[K, V]) CompareAndDelete(key K, expected any) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current, ok := m.inner[key]
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	current, ok := m.state.inner[key]
 	if !ok {
 		return false
 	}
 	if any(current) != expected {
 		return false
 	}
-	delete(m.inner, key)
+	delete(m.state.inner, key)
 	return true
 }
 
 // Get gets the value for the specified key from the map.
 func (m *Map[K, V]) Get(key K) (V, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	v, ok := m.inner[key]
+	m.state.mu.RLock()
+	defer m.state.mu.RUnlock()
+	v, ok := m.state.inner[key]
 	return v, ok
 }
 
 // Len returns the number of items in the map.
 func (m *Map[K, V]) Len() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.inner)
+	m.state.mu.RLock()
+	defer m.state.mu.RUnlock()
+	return len(m.state.inner)
 }
 
 // GetOrSet gets and returns the key if it exists, otherwise, it executes the
@@ -108,18 +116,18 @@ func (m *Map[K, V]) GetOrSet(key K, fn func() V) V {
 
 // Take gets an item and then deletes it.
 func (m *Map[K, V]) Take(key K) (V, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	v, ok := m.inner[key]
-	delete(m.inner, key)
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	v, ok := m.state.inner[key]
+	delete(m.state.inner, key)
 	return v, ok
 }
 
 // Copy returns a copy of the inner map.
 func (m *Map[K, V]) Copy() map[K]V {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return maps.Clone(m.inner)
+	m.state.mu.RLock()
+	defer m.state.mu.RUnlock()
+	return maps.Clone(m.state.inner)
 }
 
 // Seq2 returns an iter.Seq2 that yields key-value pairs from the map.
@@ -160,15 +168,21 @@ func (Map[K, V]) JSONSchemaAlias() any { //nolint
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (m *Map[K, V]) UnmarshalJSON(data []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.inner = make(map[K]V)
-	return json.Unmarshal(data, &m.inner)
+	if m.state == nil {
+		// Reached when unmarshaling into a zero-value Map, e.g.
+		// json.Unmarshal(data, &Map[K, V]{}) or a nil *Map[K, V] field
+		// that encoding/json allocates on our behalf.
+		m.state = &mapState[K, V]{}
+	}
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	m.state.inner = make(map[K]V)
+	return json.Unmarshal(data, &m.state.inner)
 }
 
 // MarshalJSON implements json.Marshaler.
 func (m *Map[K, V]) MarshalJSON() ([]byte, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return json.Marshal(m.inner)
+	m.state.mu.RLock()
+	defer m.state.mu.RUnlock()
+	return json.Marshal(m.state.inner)
 }
