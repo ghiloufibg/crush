@@ -95,6 +95,9 @@ type App struct {
 	// against app.eventsCtx, so it stops the same way every other
 	// service subscription does on shutdown.
 	podWatcher *k8s.Watcher
+
+	// deploymentWatcher mirrors podWatcher for the Deployments panel.
+	deploymentWatcher *k8s.DeploymentWatcher
 }
 
 // New initializes a new application instance. skillsMgr carries the
@@ -136,7 +139,8 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		// so the Pods panel should show everything the current kubeconfig
 		// context can see rather than requiring the user to already know
 		// which namespace to scope to.
-		podWatcher: k8s.NewWatcher(k8s.WithAllNamespaces()),
+		podWatcher:        k8s.NewWatcher(k8s.WithAllNamespaces()),
+		deploymentWatcher: k8s.NewDeploymentWatcher(k8s.WithDeploymentAllNamespaces()),
 	}
 
 	app.setupEvents()
@@ -145,6 +149,7 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 	// (set up by setupEvents above) so it stops on the same shutdown path
 	// as every other service subscription.
 	go app.podWatcher.Run(app.eventsCtx)
+	go app.deploymentWatcher.Run(app.eventsCtx)
 
 	// Initialize clipboard support. This is best-effort; if it fails
 	// (e.g., headless environment), clipboard operations will return nil.
@@ -693,6 +698,7 @@ func (app *App) setupEvents() {
 	app.subscribe(ctx, "mcp", mcp.SubscribeEvents)
 	app.subscribe(ctx, "lsp", SubscribeLSPEvents)
 	app.subscribe(ctx, "k8s-pods", app.podWatcher.Subscribe)
+	app.subscribe(ctx, "k8s-deployments", app.deploymentWatcher.Subscribe)
 	if app.Skills != nil {
 		app.subscribe(ctx, "skills", app.Skills.SubscribeEvents)
 	}

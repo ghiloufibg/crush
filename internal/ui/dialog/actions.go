@@ -46,6 +46,27 @@ type ActionDeletePod struct {
 	Name      string
 }
 
+// ActionDeleteDeployment is a message indicating the user wants to delete a
+// deployment from the Deployments panel. It carries only namespace/name,
+// not a request to delete directly — the handler routes it through the
+// agent so the normal k8s_delete_deployment permission prompt still
+// applies. Mirrors ActionDeletePod.
+type ActionDeleteDeployment struct {
+	Namespace string
+	Name      string
+}
+
+// ActionScaleDeployment is a message indicating the user wants to scale a
+// deployment from the Deployments panel, after entering a target replica
+// count in the panel's inline prompt. Like ActionDeleteDeployment, this is
+// routed through the agent's permission-gated k8s_scale_deployment tool
+// rather than scaling directly.
+type ActionScaleDeployment struct {
+	Namespace string
+	Name      string
+	Replicas  int
+}
+
 // ActionSelectModel is a message indicating a model has been selected.
 type ActionSelectModel struct {
 	Provider       catwalk.Provider

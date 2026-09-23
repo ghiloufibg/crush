@@ -351,6 +351,11 @@ type UI struct {
 	// rather than showing it empty until the next poll completes.
 	lastKnownPods []k8s.Pod
 
+	// lastKnownDeployments is the most recent Kubernetes deployment
+	// snapshot from the k8s.DeploymentWatcher, used to seed the
+	// Deployments dialog immediately on open. Mirrors lastKnownPods.
+	lastKnownDeployments []k8s.Deployment
+
 	// sidebarLogo keeps a cached version of the sidebar sidebarLogo.
 	sidebarLogo string
 
@@ -1066,6 +1071,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastKnownPods = msg.Payload
 		if podsDialog, ok := m.dialog.Dialog(dialog.PodsID).(*dialog.Pods); ok {
 			podsDialog.SetPods(msg.Payload)
+		}
+	case pubsub.Event[[]k8s.Deployment]:
+		m.lastKnownDeployments = msg.Payload
+		if deploymentsDialog, ok := m.dialog.Dialog(dialog.DeploymentsID).(*dialog.Deployments); ok {
+			deploymentsDialog.SetDeployments(msg.Payload)
 		}
 	case pubsub.Event[mcp.Event]:
 		switch msg.Payload.Type {
@@ -2533,6 +2543,12 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	case dialog.ActionDeletePod:
 		content := fmt.Sprintf("Delete the pod %q in namespace %q using k8s_delete_pod.", msg.Name, msg.Namespace)
 		cmds = append(cmds, m.sendMessage(content))
+	case dialog.ActionDeleteDeployment:
+		content := fmt.Sprintf("Delete the deployment %q in namespace %q using k8s_delete_deployment.", msg.Name, msg.Namespace)
+		cmds = append(cmds, m.sendMessage(content))
+	case dialog.ActionScaleDeployment:
+		content := fmt.Sprintf("Scale the deployment %q in namespace %q to %d replicas using k8s_scale_deployment.", msg.Name, msg.Namespace, msg.Replicas)
+		cmds = append(cmds, m.sendMessage(content))
 	case dialog.ActionAttachSkill:
 		m.dialog.CloseFrontDialog()
 		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
@@ -2938,6 +2954,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			return true
 		case key.Matches(msg, m.keyMap.Pods):
 			if cmd := m.openPodsDialog(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return true
+		case key.Matches(msg, m.keyMap.Deployments):
+			if cmd := m.openDeploymentsDialog(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
 			return true
@@ -5242,6 +5263,10 @@ func (m *UI) openDialog(id string) tea.Cmd {
 		if cmd := m.openPodsDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.DeploymentsID:
+		if cmd := m.openDeploymentsDialog(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case dialog.FilePickerID:
 		if cmd := m.openFilesDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -5362,6 +5387,20 @@ func (m *UI) openPodsDialog() tea.Cmd {
 
 	podsDialog := dialog.NewPods(m.com, m.lastKnownPods)
 	m.dialog.OpenDialog(podsDialog)
+	return nil
+}
+
+// openDeploymentsDialog opens the Kubernetes deployments panel. If it's
+// already open, it brings it to the front instead of reopening. Mirrors
+// openPodsDialog.
+func (m *UI) openDeploymentsDialog() tea.Cmd {
+	if m.dialog.ContainsDialog(dialog.DeploymentsID) {
+		m.dialog.BringToFront(dialog.DeploymentsID)
+		return nil
+	}
+
+	deploymentsDialog := dialog.NewDeployments(m.com, m.lastKnownDeployments)
+	m.dialog.OpenDialog(deploymentsDialog)
 	return nil
 }
 

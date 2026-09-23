@@ -76,16 +76,17 @@ type KeyMap struct {
 	}
 
 	// Global key maps
-	Quit       key.Binding
-	Help       key.Binding
-	Commands   key.Binding
-	Models     key.Binding
-	Suspend    key.Binding
-	Sessions   key.Binding
-	Pods       key.Binding
-	Tab        key.Binding
-	ToggleYolo key.Binding
-	ShiftTab   key.Binding
+	Quit        key.Binding
+	Help        key.Binding
+	Commands    key.Binding
+	Models      key.Binding
+	Suspend     key.Binding
+	Sessions    key.Binding
+	Pods        key.Binding
+	Deployments key.Binding
+	Tab         key.Binding
+	ToggleYolo  key.Binding
+	ShiftTab    key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -120,6 +121,10 @@ func DefaultKeyMap() KeyMap {
 		Pods: key.NewBinding(
 			key.WithKeys("ctrl+b"),
 			key.WithHelp("ctrl+b", "pods"),
+		),
+		Deployments: key.NewBinding(
+			key.WithKeys("ctrl+e"),
+			key.WithHelp("ctrl+e", "deployments"),
 		),
 		Tab: key.NewBinding(
 			key.WithKeys("tab"),

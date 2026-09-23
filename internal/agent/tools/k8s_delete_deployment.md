@@ -1,0 +1,1 @@
+Delete a Kubernetes deployment via `kubectl delete deployment`. This is a mutating, destructive action that requires explicit user permission before it runs. Namespace and name are both required — there is no default namespace. Use k8s_get_deployments first to confirm the exact namespace and name.

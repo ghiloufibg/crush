@@ -1,0 +1,1 @@
+Scale a Kubernetes deployment to a target replica count via `kubectl scale deployment`. This is a mutating action that requires explicit user permission before it runs. Namespace, name, and replicas are all required; replicas must not be negative. Use k8s_get_deployments first to confirm the exact namespace and name.
