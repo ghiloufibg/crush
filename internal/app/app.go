@@ -28,6 +28,7 @@ import (
 	"github.com/charmbracelet/crush/internal/format"
 	"github.com/charmbracelet/crush/internal/herdr"
 	"github.com/charmbracelet/crush/internal/history"
+	"github.com/charmbracelet/crush/internal/k8s"
 	"github.com/charmbracelet/crush/internal/log"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
@@ -88,6 +89,12 @@ type App struct {
 	// herdrClient reports agent state to herdr when running inside
 	// a herdr-managed pane. Nil when not in a herdr environment.
 	herdrClient *herdr.Client
+
+	// podWatcher polls the current kubeconfig context for pod state and
+	// publishes snapshots for the Pods panel. Its Run loop is started
+	// against app.eventsCtx, so it stops the same way every other
+	// service subscription does on shutdown.
+	podWatcher *k8s.Watcher
 }
 
 // New initializes a new application instance. skillsMgr carries the
@@ -125,9 +132,19 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 		tuiWG:              &sync.WaitGroup{},
 		agentNotifications: pubsub.NewBroker[notify.Notification](),
 		runCompletions:     pubsub.NewBroker[notify.RunComplete](),
+		// All-namespaces by default: this is a k9s-style validation spike,
+		// so the Pods panel should show everything the current kubeconfig
+		// context can see rather than requiring the user to already know
+		// which namespace to scope to.
+		podWatcher: k8s.NewWatcher(k8s.WithAllNamespaces()),
 	}
 
 	app.setupEvents()
+
+	// Start polling for pod state in the background. Tied to eventsCtx
+	// (set up by setupEvents above) so it stops on the same shutdown path
+	// as every other service subscription.
+	go app.podWatcher.Run(app.eventsCtx)
 
 	// Initialize clipboard support. This is best-effort; if it fails
 	// (e.g., headless environment), clipboard operations will return nil.
@@ -675,6 +692,7 @@ func (app *App) setupEvents() {
 	app.subscribeMustDeliver(ctx, "run-completions", app.runCompletions.Subscribe)
 	app.subscribe(ctx, "mcp", mcp.SubscribeEvents)
 	app.subscribe(ctx, "lsp", SubscribeLSPEvents)
+	app.subscribe(ctx, "k8s-pods", app.podWatcher.Subscribe)
 	if app.Skills != nil {
 		app.subscribe(ctx, "skills", app.Skills.SubscribeEvents)
 	}

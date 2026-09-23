@@ -1,0 +1,1 @@
+List Kubernetes pods via `kubectl get pods`. Returns namespace, name, phase, and total container restarts for each pod, sorted by namespace then name. Defaults to the current kubeconfig context's namespace; set all_namespaces to list across the whole cluster.

@@ -39,6 +39,7 @@ import (
 	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/home"
+	"github.com/charmbracelet/crush/internal/k8s"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
@@ -344,6 +345,11 @@ type UI struct {
 
 	// skills
 	skillStates []*skills.SkillState
+
+	// lastKnownPods is the most recent Kubernetes pod snapshot from the
+	// k8s.Watcher, used to seed the Pods dialog immediately on open
+	// rather than showing it empty until the next poll completes.
+	lastKnownPods []k8s.Pod
 
 	// sidebarLogo keeps a cached version of the sidebar sidebarLogo.
 	sidebarLogo string
@@ -1056,6 +1062,11 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case pubsub.Event[skills.Event]:
 		m.skillStates = msg.Payload.States
+	case pubsub.Event[[]k8s.Pod]:
+		m.lastKnownPods = msg.Payload
+		if podsDialog, ok := m.dialog.Dialog(dialog.PodsID).(*dialog.Pods); ok {
+			podsDialog.SetPods(msg.Payload)
+		}
 	case pubsub.Event[mcp.Event]:
 		switch msg.Payload.Type {
 		case mcp.EventStateChanged:
@@ -2519,6 +2530,9 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		}
 		cmds = append(cmds, m.sendMessage(content))
 		m.dialog.CloseFrontDialog()
+	case dialog.ActionDeletePod:
+		content := fmt.Sprintf("Delete the pod %q in namespace %q using k8s_delete_pod.", msg.Name, msg.Namespace)
+		cmds = append(cmds, m.sendMessage(content))
 	case dialog.ActionAttachSkill:
 		m.dialog.CloseFrontDialog()
 		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
@@ -2919,6 +2933,11 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			return true
 		case key.Matches(msg, m.keyMap.Sessions):
 			if cmd := m.openSessionsDialog(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			return true
+		case key.Matches(msg, m.keyMap.Pods):
+			if cmd := m.openPodsDialog(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
 			return true
@@ -5219,6 +5238,10 @@ func (m *UI) openDialog(id string) tea.Cmd {
 		if cmd := m.openNotificationsDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.PodsID:
+		if cmd := m.openPodsDialog(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case dialog.FilePickerID:
 		if cmd := m.openFilesDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -5323,6 +5346,22 @@ func (m *UI) openNotificationsDialog() tea.Cmd {
 
 	notificationsDialog := dialog.NewNotifications(m.com)
 	m.dialog.OpenDialog(notificationsDialog)
+	return nil
+}
+
+// openPodsDialog opens the Kubernetes pods panel. If it's already open,
+// it brings it to the front instead of reopening. The dialog starts with
+// whatever pods have most recently been seen; a live snapshot arrives
+// shortly after via the pubsub.Event[[]k8s.Pod] case, once the watcher's
+// next poll completes.
+func (m *UI) openPodsDialog() tea.Cmd {
+	if m.dialog.ContainsDialog(dialog.PodsID) {
+		m.dialog.BringToFront(dialog.PodsID)
+		return nil
+	}
+
+	podsDialog := dialog.NewPods(m.com, m.lastKnownPods)
+	m.dialog.OpenDialog(podsDialog)
 	return nil
 }
 

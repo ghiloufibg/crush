@@ -37,6 +37,15 @@ type ActionSelectSession struct {
 	Session session.Session
 }
 
+// ActionDeletePod is a message indicating the user wants to delete a pod
+// from the Pods panel. It carries only namespace/name, not a request to
+// delete directly — the handler routes it through the agent so the normal
+// k8s_delete_pod permission prompt still applies.
+type ActionDeletePod struct {
+	Namespace string
+	Name      string
+}
+
 // ActionSelectModel is a message indicating a model has been selected.
 type ActionSelectModel struct {
 	Provider       catwalk.Provider

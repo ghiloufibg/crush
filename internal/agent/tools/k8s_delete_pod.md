@@ -1,0 +1,1 @@
+Delete a Kubernetes pod via `kubectl delete pod`. This is a mutating, destructive action that requires explicit user permission before it runs. Namespace and name are both required — there is no default namespace and no way to delete more than one pod per call. Use k8s_get_pods first to confirm the exact namespace and name.

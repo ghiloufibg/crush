@@ -82,6 +82,7 @@ type KeyMap struct {
 	Models     key.Binding
 	Suspend    key.Binding
 	Sessions   key.Binding
+	Pods       key.Binding
 	Tab        key.Binding
 	ToggleYolo key.Binding
 	ShiftTab   key.Binding
@@ -112,6 +113,13 @@ func DefaultKeyMap() KeyMap {
 		Sessions: key.NewBinding(
 			key.WithKeys("ctrl+s"),
 			key.WithHelp("ctrl+s", "sessions"),
+		),
+		// "ctrl+k" would be the more obvious mnemonic, but Chat.Up already
+		// binds it (scroll up) and takes precedence whenever chat is
+		// focused, so this would silently do nothing in the common case.
+		Pods: key.NewBinding(
+			key.WithKeys("ctrl+b"),
+			key.WithHelp("ctrl+b", "pods"),
 		),
 		Tab: key.NewBinding(
 			key.WithKeys("tab"),
