@@ -2,6 +2,7 @@ package dialog
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -45,12 +46,18 @@ type Deployments struct {
 	replicasInput textinput.Model
 	scalingTarget k8s.Deployment
 
+	// deployments is the last snapshot rendered into list, kept so
+	// SetDeployments can skip rebuilding and redrawing on an unchanged
+	// poll. Mirrors [Pods.pods].
+	deployments []k8s.Deployment
+
 	keyMap struct {
 		Next     key.Binding
 		Previous key.Binding
 		UpDown   key.Binding
 		Delete   key.Binding
 		Scale    key.Binding
+		ViewPods key.Binding
 		Confirm  key.Binding
 		Close    key.Binding
 	}
@@ -109,6 +116,10 @@ func NewDeployments(com *common.Common, deployments []k8s.Deployment) *Deploymen
 		key.WithKeys("s"),
 		key.WithHelp("s", "scale deployment"),
 	)
+	d.keyMap.ViewPods = key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("enter", "view pods"),
+	)
 	d.keyMap.Confirm = key.NewBinding(
 		key.WithKeys("enter"),
 		key.WithHelp("enter", "confirm"),
@@ -131,8 +142,14 @@ func (d *Deployments) ID() string {
 
 // SetDeployments replaces the panel's deployment list with a fresh
 // snapshot, keeping the current selection on the same deployment where it
-// still exists.
+// still exists. A no-op when deployments is identical to the currently
+// displayed snapshot, mirroring [Pods.SetPods].
 func (d *Deployments) SetDeployments(deployments []k8s.Deployment) {
+	if slices.EqualFunc(d.deployments, deployments, k8s.Deployment.Equal) {
+		return
+	}
+	d.deployments = deployments
+
 	var selectedKey string
 	if item, ok := d.list.SelectedItem().(*DeploymentItem); ok {
 		selectedKey = item.deployment.Key()
@@ -191,6 +208,16 @@ func (d *Deployments) HandleMsg(msg tea.Msg) Action {
 				break
 			}
 			d.startScaling(item.deployment)
+		case key.Matches(msg, d.keyMap.ViewPods):
+			item, ok := d.list.SelectedItem().(*DeploymentItem)
+			if !ok {
+				break
+			}
+			return ActionViewDeploymentPods{
+				Namespace: item.deployment.Namespace,
+				Name:      item.deployment.Name,
+				Selector:  item.deployment.Selector,
+			}
 		}
 	}
 	return nil
@@ -294,6 +321,7 @@ func (d *Deployments) ShortHelp() []key.Binding {
 	}
 	return []key.Binding{
 		d.keyMap.UpDown,
+		d.keyMap.ViewPods,
 		d.keyMap.Scale,
 		d.keyMap.Delete,
 		d.keyMap.Close,

@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -19,13 +20,24 @@ const DefaultPollInterval = 3 * time.Second
 // reliably surface deletions across versions anyway, and a snapshot
 // replace is simpler to get right for a validation spike.
 type Watcher struct {
-	broker        *pubsub.Broker[[]Pod]
-	namespace     string
-	allNamespaces bool
-	interval      time.Duration
+	broker   *pubsub.Broker[[]Pod]
+	interval time.Duration
 	// list defaults to the package-level ListPods; tests override it to
 	// avoid shelling out to a real kubectl/cluster.
 	list func(ctx context.Context, namespace string, allNamespaces bool) ([]Pod, error)
+
+	// mu guards namespace/allNamespaces: poll (running in the Run
+	// goroutine) reads them and SetNamespace (called from the UI) writes
+	// them, so both need synchronization even though there's no complex
+	// invariant to protect.
+	mu            sync.Mutex
+	namespace     string
+	allNamespaces bool
+
+	// reconfigured wakes Run's select loop immediately after SetNamespace,
+	// so a namespace switch takes effect right away instead of waiting up
+	// to interval for the next tick.
+	reconfigured chan struct{}
 }
 
 // Option configures a [Watcher].
@@ -50,14 +62,39 @@ func WithPollInterval(d time.Duration) Option {
 // NewWatcher creates a Watcher. Call Run in a goroutine to start polling.
 func NewWatcher(opts ...Option) *Watcher {
 	w := &Watcher{
-		broker:   pubsub.NewBroker[[]Pod](),
-		interval: DefaultPollInterval,
-		list:     ListPods,
+		broker:       pubsub.NewBroker[[]Pod](),
+		interval:     DefaultPollInterval,
+		list:         ListPods,
+		reconfigured: make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(w)
 	}
 	return w
+}
+
+// SetNamespace retargets the watcher at namespace (or every namespace, when
+// allNamespaces is true), taking effect immediately rather than waiting for
+// the next scheduled poll. Safe to call concurrently with Run.
+func (w *Watcher) SetNamespace(namespace string, allNamespaces bool) {
+	w.mu.Lock()
+	w.namespace = namespace
+	w.allNamespaces = allNamespaces
+	w.mu.Unlock()
+
+	select {
+	case w.reconfigured <- struct{}{}:
+	default:
+		// A reconfigure is already pending; poll will pick up the latest
+		// values above once it runs.
+	}
+}
+
+// Namespace reports the watcher's current namespace scope.
+func (w *Watcher) Namespace() (namespace string, allNamespaces bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.namespace, w.allNamespaces
 }
 
 // Subscribe returns a channel of pod-list snapshots. The channel closes
@@ -84,12 +121,16 @@ func (w *Watcher) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			w.poll(ctx)
+		case <-w.reconfigured:
+			w.poll(ctx)
+			ticker.Reset(w.interval)
 		}
 	}
 }
 
 func (w *Watcher) poll(ctx context.Context) {
-	pods, err := w.list(ctx, w.namespace, w.allNamespaces)
+	namespace, allNamespaces := w.Namespace()
+	pods, err := w.list(ctx, namespace, allNamespaces)
 	if err != nil {
 		return
 	}

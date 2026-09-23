@@ -35,6 +35,23 @@ func TestParseKubectlPodListSortsByNamespaceThenName(t *testing.T) {
 	}, pods)
 }
 
+func TestParseKubectlPodListCapturesLabels(t *testing.T) {
+	t.Parallel()
+
+	stdout := `{
+		"items": [
+			{
+				"metadata": {"name": "api-1", "namespace": "dev", "labels": {"app": "api", "tier": "backend"}},
+				"status": {"phase": "Running"}
+			}
+		]
+	}`
+
+	pods, err := parseKubectlPodList(stdout)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"app": "api", "tier": "backend"}, pods[0].Labels)
+}
+
 func TestParseKubectlPodListEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -59,4 +76,69 @@ func TestFormatPodList(t *testing.T) {
 		{Namespace: "dev", Name: "api-1", Phase: "Running", Restarts: 2},
 	})
 	require.Equal(t, "NAMESPACE\tNAME\tSTATUS\tRESTARTS\ndev\tapi-1\tRunning\t2\n", got)
+}
+
+func TestFilterAndCapPodsNameContains(t *testing.T) {
+	t.Parallel()
+
+	pods := []Pod{
+		{Namespace: "dev", Name: "api-1"},
+		{Namespace: "dev", Name: "web-1"},
+		{Namespace: "dev", Name: "api-2"},
+	}
+
+	result := filterAndCapPods(pods, "api", 0)
+	require.Equal(t, []Pod{
+		{Namespace: "dev", Name: "api-1"},
+		{Namespace: "dev", Name: "api-2"},
+	}, result.Pods)
+	require.Equal(t, 2, result.TotalMatched)
+	require.False(t, result.Truncated)
+}
+
+func TestFilterAndCapPodsMaxResults(t *testing.T) {
+	t.Parallel()
+
+	pods := []Pod{
+		{Namespace: "dev", Name: "api-1"},
+		{Namespace: "dev", Name: "api-2"},
+		{Namespace: "dev", Name: "api-3"},
+	}
+
+	result := filterAndCapPods(pods, "", 2)
+	require.Equal(t, pods[:2], result.Pods)
+	require.Equal(t, 3, result.TotalMatched)
+	require.True(t, result.Truncated)
+}
+
+func TestFilterAndCapPodsMaxResultsNotExceeded(t *testing.T) {
+	t.Parallel()
+
+	pods := []Pod{{Namespace: "dev", Name: "api-1"}}
+
+	result := filterAndCapPods(pods, "", 50)
+	require.Equal(t, pods, result.Pods)
+	require.False(t, result.Truncated)
+}
+
+func TestFormatPodListResultTruncated(t *testing.T) {
+	t.Parallel()
+
+	result := ListPodsResult{
+		Pods:         []Pod{{Namespace: "dev", Name: "api-1", Phase: "Running", Restarts: 0}},
+		TotalMatched: 4,
+		Truncated:    true,
+	}
+	got := FormatPodListResult(result)
+	require.Equal(t,
+		"NAMESPACE\tNAME\tSTATUS\tRESTARTS\ndev\tapi-1\tRunning\t0\n...3 more not shown, narrow with label_selector or name_contains\n",
+		got,
+	)
+}
+
+func TestFormatPodListResultNotTruncated(t *testing.T) {
+	t.Parallel()
+
+	result := ListPodsResult{Pods: nil, TotalMatched: 0, Truncated: false}
+	require.Equal(t, "No pods found", FormatPodListResult(result))
 }

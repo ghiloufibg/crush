@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/pubsub"
@@ -16,13 +17,20 @@ import (
 // real syntax cost for only two resource types so far. Revisit generics if
 // a third resource type makes the duplication itself the bigger cost.
 type DeploymentWatcher struct {
-	broker        *pubsub.Broker[[]Deployment]
-	namespace     string
-	allNamespaces bool
-	interval      time.Duration
+	broker   *pubsub.Broker[[]Deployment]
+	interval time.Duration
 	// list defaults to the package-level ListDeployments; tests override it
 	// to avoid shelling out to a real kubectl/cluster.
 	list func(ctx context.Context, namespace string, allNamespaces bool) ([]Deployment, error)
+
+	// mu guards namespace/allNamespaces, same rationale as [Watcher.mu].
+	mu            sync.Mutex
+	namespace     string
+	allNamespaces bool
+
+	// reconfigured wakes Run's select loop immediately after SetNamespace,
+	// same rationale as [Watcher.reconfigured].
+	reconfigured chan struct{}
 }
 
 // DeploymentOption configures a [DeploymentWatcher].
@@ -48,14 +56,39 @@ func WithDeploymentPollInterval(d time.Duration) DeploymentOption {
 // to start polling.
 func NewDeploymentWatcher(opts ...DeploymentOption) *DeploymentWatcher {
 	w := &DeploymentWatcher{
-		broker:   pubsub.NewBroker[[]Deployment](),
-		interval: DefaultPollInterval,
-		list:     ListDeployments,
+		broker:       pubsub.NewBroker[[]Deployment](),
+		interval:     DefaultPollInterval,
+		list:         ListDeployments,
+		reconfigured: make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(w)
 	}
 	return w
+}
+
+// SetNamespace retargets the watcher at namespace (or every namespace, when
+// allNamespaces is true), taking effect immediately rather than waiting for
+// the next scheduled poll. Safe to call concurrently with Run.
+func (w *DeploymentWatcher) SetNamespace(namespace string, allNamespaces bool) {
+	w.mu.Lock()
+	w.namespace = namespace
+	w.allNamespaces = allNamespaces
+	w.mu.Unlock()
+
+	select {
+	case w.reconfigured <- struct{}{}:
+	default:
+		// A reconfigure is already pending; poll will pick up the latest
+		// values above once it runs.
+	}
+}
+
+// Namespace reports the watcher's current namespace scope.
+func (w *DeploymentWatcher) Namespace() (namespace string, allNamespaces bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.namespace, w.allNamespaces
 }
 
 // Subscribe returns a channel of deployment-list snapshots. The channel
@@ -79,12 +112,16 @@ func (w *DeploymentWatcher) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			w.poll(ctx)
+		case <-w.reconfigured:
+			w.poll(ctx)
+			ticker.Reset(w.interval)
 		}
 	}
 }
 
 func (w *DeploymentWatcher) poll(ctx context.Context) {
-	deployments, err := w.list(ctx, w.namespace, w.allNamespaces)
+	namespace, allNamespaces := w.Namespace()
+	deployments, err := w.list(ctx, namespace, allNamespaces)
 	if err != nil {
 		return
 	}

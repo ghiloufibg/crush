@@ -83,6 +83,40 @@ func TestPodsHandleMsgDeleteReturnsActionDeletePod(t *testing.T) {
 	require.Equal(t, "web-1", del.Name)
 }
 
+func TestPodsHandleMsgLogsReturnsActionViewPodLogs(t *testing.T) {
+	t.Parallel()
+
+	pods := []k8s.Pod{
+		{Namespace: "dev", Name: "api-1"},
+		{Namespace: "prod", Name: "web-1"},
+	}
+	d := newPodsDialog(t, pods)
+	require.Nil(t, d.HandleMsg(tea.KeyPressMsg{Code: 'j', Text: "j"}))
+
+	action := d.HandleMsg(tea.KeyPressMsg{Code: 'l', Text: "l"})
+	logs, ok := action.(ActionViewPodLogs)
+	require.True(t, ok)
+	require.Equal(t, "prod", logs.Namespace)
+	require.Equal(t, "web-1", logs.Name)
+}
+
+func TestPodsHandleMsgExecReturnsActionExecPod(t *testing.T) {
+	t.Parallel()
+
+	pods := []k8s.Pod{
+		{Namespace: "dev", Name: "api-1"},
+		{Namespace: "prod", Name: "web-1"},
+	}
+	d := newPodsDialog(t, pods)
+	require.Nil(t, d.HandleMsg(tea.KeyPressMsg{Code: 'j', Text: "j"}))
+
+	action := d.HandleMsg(tea.KeyPressMsg{Code: 'e', Text: "e"})
+	exec, ok := action.(ActionExecPod)
+	require.True(t, ok)
+	require.Equal(t, "prod", exec.Namespace)
+	require.Equal(t, "web-1", exec.Name)
+}
+
 func TestPodsHandleMsgCloseReturnsActionClose(t *testing.T) {
 	t.Parallel()
 

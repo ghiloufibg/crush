@@ -215,6 +215,21 @@ func TestDeploymentsScaleConfirmWithInvalidReplicasReturnsWarningAndStaysInScali
 	require.True(t, d.scaling)
 }
 
+func TestDeploymentsViewPodsReturnsActionViewDeploymentPods(t *testing.T) {
+	t.Parallel()
+
+	d := newDeploymentsDialog(t, []k8s.Deployment{
+		{Namespace: "dev", Name: "api", Selector: map[string]string{"app": "api"}},
+	})
+
+	action := d.HandleMsg(tea.KeyPressMsg{Code: tea.KeyEnter})
+	view, ok := action.(ActionViewDeploymentPods)
+	require.True(t, ok)
+	require.Equal(t, "dev", view.Namespace)
+	require.Equal(t, "api", view.Name)
+	require.Equal(t, map[string]string{"app": "api"}, view.Selector)
+}
+
 func TestDeploymentsScaleCloseCancelsWithoutSubmitting(t *testing.T) {
 	t.Parallel()
 

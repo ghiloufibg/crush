@@ -2,6 +2,7 @@ package dialog
 
 import (
 	"fmt"
+	"slices"
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
@@ -34,11 +35,19 @@ type Pods struct {
 	help help.Model
 	list *list.FilterableList
 
+	// pods is the last snapshot rendered into list, kept so SetPods can
+	// skip rebuilding and redrawing when a poll comes back unchanged —
+	// the common case at a 3s poll interval, since most polls see no
+	// cluster change at all.
+	pods []k8s.Pod
+
 	keyMap struct {
 		Next     key.Binding
 		Previous key.Binding
 		UpDown   key.Binding
 		Delete   key.Binding
+		Logs     key.Binding
+		Exec     key.Binding
 		Close    key.Binding
 	}
 }
@@ -91,6 +100,14 @@ func NewPods(com *common.Common, pods []k8s.Pod) *Pods {
 		key.WithKeys("d"),
 		key.WithHelp("d", "delete pod"),
 	)
+	d.keyMap.Logs = key.NewBinding(
+		key.WithKeys("l"),
+		key.WithHelp("l", "view logs"),
+	)
+	d.keyMap.Exec = key.NewBinding(
+		key.WithKeys("e"),
+		key.WithHelp("e", "exec shell"),
+	)
 	d.keyMap.Close = CloseKey
 
 	d.SetPods(pods)
@@ -103,8 +120,15 @@ func (d *Pods) ID() string {
 }
 
 // SetPods replaces the panel's pod list with a fresh snapshot, keeping
-// the current selection on the same pod where it still exists.
+// the current selection on the same pod where it still exists. A no-op
+// when pods is identical to the currently displayed snapshot, so an
+// unchanged poll doesn't rebuild every row or force a redraw.
 func (d *Pods) SetPods(pods []k8s.Pod) {
+	if slices.EqualFunc(d.pods, pods, k8s.Pod.Equal) {
+		return
+	}
+	d.pods = pods
+
 	var selectedKey string
 	if item, ok := d.list.SelectedItem().(*PodItem); ok {
 		selectedKey = item.pod.Key()
@@ -153,6 +177,18 @@ func (d *Pods) HandleMsg(msg tea.Msg) Action {
 				break
 			}
 			return ActionDeletePod{Namespace: item.pod.Namespace, Name: item.pod.Name}
+		case key.Matches(msg, d.keyMap.Logs):
+			item, ok := d.list.SelectedItem().(*PodItem)
+			if !ok {
+				break
+			}
+			return ActionViewPodLogs{Namespace: item.pod.Namespace, Name: item.pod.Name}
+		case key.Matches(msg, d.keyMap.Exec):
+			item, ok := d.list.SelectedItem().(*PodItem)
+			if !ok {
+				break
+			}
+			return ActionExecPod{Namespace: item.pod.Namespace, Name: item.pod.Name}
 		}
 	}
 	return nil
@@ -198,6 +234,8 @@ func (d *Pods) ShortHelp() []key.Binding {
 	return []key.Binding{
 		d.keyMap.UpDown,
 		d.keyMap.Delete,
+		d.keyMap.Logs,
+		d.keyMap.Exec,
 		d.keyMap.Close,
 	}
 }

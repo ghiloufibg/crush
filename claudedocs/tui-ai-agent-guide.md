@@ -180,7 +180,201 @@ the existing dialog over a new dialog. Reach for a separate dialog (or
 `Arguments`) only when the parameters aren't tied to a single selected row,
 or there's more than one or two fields.
 
+## Beyond list+mutate: three more interaction shapes
+
+Pods and Deployments are both "list a resource, mutate a selected row."
+Three other features needed in this codebase don't fit that shape, and each
+required a different structural answer rather than a variation on the
+watcher/dialog/tool checklist above.
+
+### Drill-down / contextual navigation (Deployment → its Pods)
+
+`DeploymentPods` (`internal/ui/dialog/deployment_pods.go`) shows the pods
+belonging to a selected deployment. The tempting design is a second
+watcher scoped to that deployment's selector. Instead it reuses the *same*
+pod snapshot the Pods panel already has: `ActionViewDeploymentPods` passes
+`m.lastKnownPods` (the UI's last-known Pods watcher snapshot) straight into
+`dialog.NewDeploymentPods(...)`, and `SetAllPods` filters that snapshot
+client-side by `pod.Namespace == d.namespace && pod.MatchesSelector(d.selector)`
+on every subsequent update. There's no separate navigation stack, either —
+opening a drill-down for a different deployment while one is already open
+just closes the existing `DeploymentPodsID` dialog and opens a new one, and
+because the drill-down depends on the same pod watcher as the Pods panel,
+it acquires/releases that watcher independently of whether Pods itself
+happens to be open (see the watcher-lifecycle item below).
+
+Why: the pod-belongs-to-deployment relationship is already fully expressed
+by the Deployment's label selector, and the Pods watcher is already
+streaming every pod in scope. Filtering an existing live snapshot is
+free; a second `kubectl` poll loop scoped to one deployment would be a
+second watcher, a second wiring pass, and a second source of poll-interval
+lag for data this process already has in memory.
+
+### Streaming vs. snapshot-replace data (pod logs)
+
+Every watcher so far replaces its entire snapshot on each poll — the right
+shape for "what pods exist right now." Logs are different: `StreamPodLogs`
+(`internal/k8s/log_stream.go`) runs `kubectl logs -f` and keeps the process
+open, pushing each new line to an `onLine` callback as it's written, rather
+than polling and diffing. Re-fetching and re-diffing log output on an
+interval would be both wasteful (re-reading unbounded history each poll)
+and lossy (anything written between polls would need to be reconstructed
+from a diff instead of just arriving in order).
+
+Because this is a long-lived subprocess rather than a one-shot list call,
+something has to own cancelling it. `PodLogs` (`internal/ui/dialog/pod_logs.go`)
+holds the stream's `context.CancelFunc` directly and calls it from its own
+`Close()`, mirroring `MCPAuth.cancelAuth` — the dialog that started the
+subprocess is the thing responsible for stopping it, so a dismissed dialog
+can't leak a running `kubectl logs -f`.
+
+One underlying `kubectl logs` stream also ends up with three independent
+caps, each solving a different consumer's problem rather than one cap
+serving all three:
+
+- `k8s.logStreamTailLines = 500` — how much history `kubectl` itself
+  replays when the live stream starts.
+- `dialog.podLogsMaxLines = 2000` — the TUI's in-memory scrollback ring
+  buffer, bounding how much a long session can accumulate.
+- `tools.k8sGetPodLogsDefaultTailLines/MaxTailLines = 200/500` — the agent
+  tool's one-shot fetch bound, independent of whatever the TUI dialog is
+  currently showing.
+
+None of these could stand in for another: a human scrolling a live view, a
+TUI holding scrollback in memory, and an agent doing a single bounded read
+are three different consumers with three different "how much is enough"
+answers.
+
+### Runtime-reconfigurable watchers (namespace switcher)
+
+`Watcher`/`DeploymentWatcher` both expose `SetNamespace(namespace string,
+allNamespaces bool)`, which mutates the watcher's guarded namespace state
+and then does a non-blocking send on a buffered `reconfigured chan
+struct{}` that `Run`'s `select` loop also watches alongside its poll
+ticker. That's what makes a namespace switch take effect immediately
+instead of waiting up to one poll interval — the alternative (just mutate
+the field and let the next tick pick it up) would leave the panel showing
+the old namespace's data for up to the full poll interval after the user
+switched.
+
+The `Namespaces` dialog itself (`internal/ui/dialog/namespaces.go`) is
+seeded differently from every other dialog in this guide: it's a one-shot
+`K8sListNamespaces` call (`startNamespacesLoad`), not a subscription to a
+running watcher, because the set of namespaces in a cluster changes rarely
+enough that polling it continuously isn't worth a third watcher. Selecting
+an item returns `ActionSetNamespace{Namespace}` or `ActionSetNamespace{AllNamespaces:
+true}`, and `UI.Update` calls `Workspace.K8sSetNamespace`, which retargets
+*both* the pod and deployment watchers together — so Pods and Deployments
+always agree on scope, rather than each panel having its own independent
+namespace filter.
+
+### One more shape that looked like a fit but isn't: exec into a pod
+
+`ExecPodCommand` (`internal/k8s/exec.go`) builds a `kubectl exec -it ... sh`
+`*exec.Cmd` but never runs it directly — `execIntoPod` hands it to
+`tea.ExecProcess`, the same mechanism `openEditor` uses for `$EDITOR`
+handoff, generalized from a one-shot text editor session to a long-lived
+interactive shell. `tea.ExecProcess` suspends the TUI's own terminal
+control for the duration, so stdin/stdout/stderr go straight to the
+subprocess as a raw, bidirectional passthrough — the counterpart to pod
+logs' one-directional streaming capture. `ActionExecPod` closes the Pods
+dialog and releases the pod watcher *before* handing off the terminal,
+since a poll loop still ticking (and potentially trying to redraw) while
+the terminal belongs to another process is at best wasted work and at
+worst a redraw racing a suspended TUI.
+
+## Token budget checklist for agent tools
+
+Concrete practices this codebase settled on for keeping a single tool
+call's response bounded at real-cluster scale, gathered from the
+`k8s_get_pods`/`k8s_get_deployments`/`k8s_get_pod_logs` tools:
+
+- **Prefer server-side filtering over client-side, when the CLI supports
+  it.** `label_selector` is passed straight through to `kubectl get ... -l`,
+  so it narrows what `kubectl` itself returns and what this process has to
+  parse. `name_contains` can't be server-side — `kubectl` has no
+  substring-on-name flag — so it's applied after fetching. Both are
+  offered, but the tool's parameter description says so honestly rather
+  than presenting them as equivalent; an agent choosing between them should
+  know one is cheaper than the other.
+- **Always cap list results, and never truncate silently.** `max_results`
+  defaults to `k8s.DefaultListMaxResults = 50`; when the cap is hit, the
+  formatted response appends how many more matched instead of just cutting
+  the list off. Silent truncation is the failure mode this avoids: without
+  it, an agent has no way to tell "the cluster has exactly N matches" from
+  "the cluster has more than N matches and I only saw the first N."
+- **Bound the same underlying stream independently at each layer that
+  touches it.** The pod-logs tool doesn't reuse the TUI dialog's 2000-line
+  scrollback cap or `kubectl`'s own 500-line replay window — it has its own
+  200/500 default/hard-ceiling tail bound, because a human scrolling a live
+  view and an agent doing a single bounded read have different "how much is
+  enough" answers even though they're reading the same command's output.
+- **Give read-then-narrow tools a server-applied filter, not just a raw
+  fetch.** `k8s_get_pod_logs`'s `Grep` parameter filters lines before they
+  reach the response, so an agent looking for one error doesn't have to
+  fetch and reason over lines it doesn't need.
+- **Put identifying state directly in the tool-triggering message, don't
+  make the agent re-discover it.** Delete/scale actions already have the
+  namespace/name (or replica count) at keypress time, so `UI.Update` builds
+  a fully-specified instruction ("Delete the pod X in namespace Y") from the
+  `Action` struct's fields — the agent never needs a `k8s_get_pods` round
+  trip just to find identifiers the TUI already had.
+- **Treat "cheap unchanged-result signal for agent tools" as something to
+  evaluate, not a default to build.** This was considered during design and
+  deliberately left unbuilt: it's only worth the complexity if repeated
+  re-querying of the same data is actually observed happening in practice,
+  and that hasn't been observed here. Don't build a cache-invalidation
+  scheme speculatively against a problem you haven't confirmed exists.
+
+## TUI freshness/perf checklist
+
+Concrete practices this codebase settled on for keeping the TUI responsive
+and its background work proportional to what's actually visible:
+
+- **Tie watcher lifecycle to dialog visibility, not app lifetime.**
+  Ref-counted `K8sAcquire<X>Watcher`/`K8sRelease<X>Watcher` methods on the
+  `Workspace` interface (no-op in `ClientWorkspace`, real pause/resume in
+  `AppWorkspace`) mean a watcher's poll ticker only runs while at least one
+  open dialog needs its data — opening a dialog acquires, closing it (or an
+  exec-into-pod handoff suspending the terminal) releases. Without this, an
+  idle background panel would keep polling `kubectl` on a fixed interval
+  for as long as the app runs.
+- **Skip redraw work when a poll returns an unchanged snapshot.** Give the
+  domain struct an `Equal` method and compare the current vs. incoming
+  slice with `slices.EqualFunc` before rebuilding any list items — this
+  relies on the deterministic sort order `ListPods`/`ListDeployments`
+  already produce, since the comparison is positional. Applied consistently
+  across `Pods`, `Deployments`, and `DeploymentPods`: the first two compare
+  against the raw incoming snapshot, but `DeploymentPods.SetAllPods` must
+  compare against the *filtered* result (matching this dialog's own
+  namespace + selector), not the raw `allPods` input — that's what's
+  actually rendered, and comparing against the unfiltered snapshot would
+  both miss real changes (a filtered-out pod changed) and flag false ones
+  (an out-of-scope pod changed).
+- **Give a background subprocess its own owner for cancellation.**
+  Streaming dialogs hold the `context.CancelFunc` for their own subprocess
+  and call it from their own `Close()`, mirroring the existing
+  `MCPAuth.cancelAuth` pattern, so a dismissed dialog can't leak a running
+  `kubectl` process.
+- **Retarget a poll loop immediately rather than waiting out the
+  interval.** `SetNamespace` mutates guarded watcher state and does a
+  non-blocking send on a buffered `reconfigured` channel that `Run`'s
+  `select` loop watches alongside its ticker, so a namespace switch is
+  picked up on the next loop iteration instead of up to one poll interval
+  later.
+- **Bound long-lived in-memory views with a ring buffer, not an
+  ever-growing slice.** `podLogsMaxLines = 2000`, enforced in `AppendLine`,
+  keeps a log stream open for an entire session from accumulating unbounded
+  memory.
+
 ## Checklist: adding a new resource type
+
+The steps below are for a resource that fits the list+mutate,
+watcher/pubsub shape Pods and Deployments both use. They don't apply to
+logs or exec: both are subprocess streams (`kubectl logs -f`, `kubectl exec
+-it`), not polled/diffed resources, so forcing them through a
+watcher-per-resource-type checklist would be the wrong generalization —
+see "Beyond list+mutate" above for how each of those was actually built.
 
 1. `internal/k8s/<resource>.go` — domain struct + `Key()`.
 2. `internal/k8s/<resource>_client.go` — hand-rolled kubectl JSON types,

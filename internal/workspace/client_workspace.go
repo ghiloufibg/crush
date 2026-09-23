@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -801,6 +802,53 @@ func (w *ClientWorkspace) MCPAuthURL(name string) string {
 	}
 	return u
 }
+
+// -- Kubernetes --
+
+// K8sStreamPodLogs always returns ErrLogStreamingUnsupported: this spike
+// has no remote-log-streaming RPC (see the Workspace interface doc), so a
+// remote workspace fails fast rather than leaving a caller waiting for
+// lines that will never arrive.
+func (w *ClientWorkspace) K8sStreamPodLogs(ctx context.Context, namespace, name string, onLine func(string)) error {
+	return ErrLogStreamingUnsupported
+}
+
+// K8sListNamespaces always returns an error: this spike has no remote
+// namespace-listing RPC (see the Workspace interface doc).
+func (w *ClientWorkspace) K8sListNamespaces(ctx context.Context) ([]string, error) {
+	return nil, ErrNamespaceSwitchUnsupported
+}
+
+// K8sSetNamespace always returns ErrNamespaceSwitchUnsupported: this spike
+// has no remote watcher-reconfiguration RPC (see the Workspace interface
+// doc), so a remote workspace fails fast rather than silently no-oping.
+func (w *ClientWorkspace) K8sSetNamespace(namespace string, allNamespaces bool) error {
+	return ErrNamespaceSwitchUnsupported
+}
+
+// K8sNamespace always reports the zero value: this spike has no remote
+// namespace-scope RPC (see the Workspace interface doc).
+func (w *ClientWorkspace) K8sNamespace() (namespace string, allNamespaces bool) {
+	return "", false
+}
+
+// K8sExecPodCommand always returns ErrExecUnsupported: a raw PTY handoff
+// only makes sense when the TUI has direct terminal and kubectl access,
+// which a remote workspace never does (see the Workspace interface doc).
+func (w *ClientWorkspace) K8sExecPodCommand(namespace, name string) (*exec.Cmd, error) {
+	return nil, ErrExecUnsupported
+}
+
+// K8sAcquirePodWatcher, K8sReleasePodWatcher, K8sAcquireDeploymentWatcher,
+// and K8sReleaseDeploymentWatcher are no-ops: this spike has no remote
+// watcher-lifecycle RPC, so a remote workspace's server-side watcher simply
+// keeps running continuously, same as before this optimization existed.
+// Unlike the methods above, there's nothing to fail at here — this is a
+// pure performance optimization, not a feature a remote workspace can lack.
+func (w *ClientWorkspace) K8sAcquirePodWatcher()        {}
+func (w *ClientWorkspace) K8sReleasePodWatcher()        {}
+func (w *ClientWorkspace) K8sAcquireDeploymentWatcher() {}
+func (w *ClientWorkspace) K8sReleaseDeploymentWatcher() {}
 
 // -- Lifecycle --
 

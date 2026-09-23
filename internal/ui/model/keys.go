@@ -84,6 +84,7 @@ type KeyMap struct {
 	Sessions    key.Binding
 	Pods        key.Binding
 	Deployments key.Binding
+	Namespaces  key.Binding
 	Tab         key.Binding
 	ToggleYolo  key.Binding
 	ShiftTab    key.Binding
@@ -125,6 +126,10 @@ func DefaultKeyMap() KeyMap {
 		Deployments: key.NewBinding(
 			key.WithKeys("ctrl+e"),
 			key.WithHelp("ctrl+e", "deployments"),
+		),
+		Namespaces: key.NewBinding(
+			key.WithKeys("ctrl+w"),
+			key.WithHelp("ctrl+w", "namespaces"),
 		),
 		Tab: key.NewBinding(
 			key.WithKeys("tab"),

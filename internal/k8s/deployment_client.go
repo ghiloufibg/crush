@@ -31,6 +31,9 @@ type kubectlDeployment struct {
 	} `json:"metadata"`
 	Spec struct {
 		Replicas int32 `json:"replicas"`
+		Selector struct {
+			MatchLabels map[string]string `json:"matchLabels"`
+		} `json:"selector"`
 	} `json:"spec"`
 	Status struct {
 		Replicas          int32 `json:"replicas"`
@@ -44,13 +47,66 @@ type kubectlDeployment struct {
 // sorted by namespace then name. When allNamespaces is true, namespace is
 // ignored and deployments are listed across the whole cluster; otherwise an
 // empty namespace uses the current kubeconfig context's default namespace.
+//
+// This is a thin, unfiltered/uncapped convenience wrapper around
+// [ListDeploymentsFiltered] for callers — chiefly [DeploymentWatcher] —
+// that always want the complete snapshot; agent tools wanting
+// label/name filtering or a result cap should call
+// ListDeploymentsFiltered directly.
 func ListDeployments(ctx context.Context, namespace string, allNamespaces bool) ([]Deployment, error) {
+	result, err := ListDeploymentsFiltered(ctx, ListDeploymentsOptions{Namespace: namespace, AllNamespaces: allNamespaces})
+	if err != nil {
+		return nil, err
+	}
+	return result.Deployments, nil
+}
+
+// ListDeploymentsOptions configures [ListDeploymentsFiltered]. The zero
+// value lists every deployment in Namespace (or every namespace, if
+// AllNamespaces), matching [ListDeployments]'s behavior.
+type ListDeploymentsOptions struct {
+	Namespace     string
+	AllNamespaces bool
+	// LabelSelector is passed straight through to
+	// `kubectl get deployments -l`, so filtering happens inside the
+	// kubectl process itself — it shrinks both the kubectl output and the
+	// parsing work, not just the final formatted text.
+	LabelSelector string
+	// NameContains keeps only deployments whose name contains this
+	// substring. kubectl has no server-side name-substring filter, so
+	// unlike LabelSelector this is necessarily applied client-side, after
+	// the (possibly label-filtered) list already came back.
+	NameContains string
+	// MaxResults caps the number of deployments returned. Zero (or
+	// negative) means unlimited.
+	MaxResults int
+}
+
+// ListDeploymentsResult is the outcome of [ListDeploymentsFiltered].
+// TotalMatched is the count after LabelSelector/NameContains filtering but
+// before the MaxResults cap, so a caller that hits the cap can report how
+// many results were omitted instead of leaving an agent to conclude the
+// cluster only has len(Deployments) matching deployments.
+type ListDeploymentsResult struct {
+	Deployments  []Deployment
+	TotalMatched int
+	Truncated    bool
+}
+
+// ListDeploymentsFiltered lists deployments via
+// `kubectl get deployments -o json`, applying opts' server-side label
+// selector, then opts' client-side name-substring filter and result cap.
+// See [ListDeploymentsOptions] for how each filter is applied.
+func ListDeploymentsFiltered(ctx context.Context, opts ListDeploymentsOptions) (ListDeploymentsResult, error) {
 	args := []string{"get", "deployments", "-o", "json"}
 	switch {
-	case allNamespaces:
+	case opts.AllNamespaces:
 		args = append(args, "--all-namespaces")
-	case namespace != "":
-		args = append(args, "-n", namespace)
+	case opts.Namespace != "":
+		args = append(args, "-n", opts.Namespace)
+	}
+	if opts.LabelSelector != "" {
+		args = append(args, "-l", opts.LabelSelector)
 	}
 
 	cmdCtx, cancel := context.WithTimeout(ctx, listDeploymentsTimeout)
@@ -63,16 +119,46 @@ func ListDeployments(ctx context.Context, namespace string, allNamespaces bool) 
 
 	if err := cmd.Run(); err != nil {
 		if cmdCtx.Err() != nil {
-			return nil, fmt.Errorf("kubectl get deployments timed out")
+			return ListDeploymentsResult{}, fmt.Errorf("kubectl get deployments timed out")
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return nil, fmt.Errorf("kubectl get deployments failed: %s", msg)
+		return ListDeploymentsResult{}, fmt.Errorf("kubectl get deployments failed: %s", msg)
 	}
 
-	return parseKubectlDeploymentList(stdout.String())
+	deployments, err := parseKubectlDeploymentList(stdout.String())
+	if err != nil {
+		return ListDeploymentsResult{}, err
+	}
+
+	return filterAndCapDeployments(deployments, opts.NameContains, opts.MaxResults), nil
+}
+
+// filterAndCapDeployments applies NameContains and MaxResults to an
+// already-parsed, already-sorted deployment list. Split out from
+// ListDeploymentsFiltered so this logic is unit-testable without shelling
+// out to kubectl.
+func filterAndCapDeployments(deployments []Deployment, nameContains string, maxResults int) ListDeploymentsResult {
+	if nameContains != "" {
+		filtered := make([]Deployment, 0, len(deployments))
+		for _, d := range deployments {
+			if strings.Contains(d.Name, nameContains) {
+				filtered = append(filtered, d)
+			}
+		}
+		deployments = filtered
+	}
+
+	result := ListDeploymentsResult{TotalMatched: len(deployments)}
+	if maxResults > 0 && len(deployments) > maxResults {
+		result.Deployments = deployments[:maxResults]
+		result.Truncated = true
+	} else {
+		result.Deployments = deployments
+	}
+	return result
 }
 
 // parseKubectlDeploymentList parses `kubectl get deployments -o json` output
@@ -94,6 +180,7 @@ func parseKubectlDeploymentList(stdout string) ([]Deployment, error) {
 			UpToDate:  item.Status.UpdatedReplicas,
 			Available: item.Status.AvailableReplicas,
 			Replicas:  item.Spec.Replicas,
+			Selector:  item.Spec.Selector.MatchLabels,
 		}
 	}
 	sort.Slice(deployments, func(i, j int) bool {
@@ -185,4 +272,16 @@ func FormatDeploymentList(deployments []Deployment) string {
 		fmt.Fprintf(&b, "%s\t%s\t%s\t%d\t%d\n", d.Namespace, d.Name, d.Ready, d.UpToDate, d.Available)
 	}
 	return b.String()
+}
+
+// FormatDeploymentListResult renders result as [FormatDeploymentList] does,
+// appending an explicit truncation notice when result.Truncated — so an
+// agent that hits the cap can tell it hit a cap, not conclude the cluster
+// only has len(result.Deployments) matching deployments.
+func FormatDeploymentListResult(result ListDeploymentsResult) string {
+	s := FormatDeploymentList(result.Deployments)
+	if result.Truncated {
+		s += fmt.Sprintf("...%d more not shown, narrow with label_selector or name_contains\n", result.TotalMatched-len(result.Deployments))
+	}
+	return s
 }

@@ -85,3 +85,48 @@ func TestWatcherPassesNamespaceAndAllNamespacesOptions(t *testing.T) {
 	require.Equal(t, "staging", gotNamespace)
 	require.True(t, gotAll)
 }
+
+func TestWatcherSetNamespaceTakesEffectImmediately(t *testing.T) {
+	t.Parallel()
+
+	calls := make(chan struct {
+		namespace     string
+		allNamespaces bool
+	}, 4)
+	w := NewWatcher(WithNamespace("dev"), WithPollInterval(time.Hour))
+	w.list = func(_ context.Context, namespace string, allNamespaces bool) ([]Pod, error) {
+		calls <- struct {
+			namespace     string
+			allNamespaces bool
+		}{namespace, allNamespaces}
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		w.Run(ctx)
+		close(done)
+	}()
+
+	first := <-calls
+	require.Equal(t, "dev", first.namespace)
+	require.False(t, first.allNamespaces)
+
+	// With a one-hour poll interval, the next call only arrives if
+	// SetNamespace wakes Run's loop immediately rather than waiting for the
+	// next tick.
+	w.SetNamespace("staging", false)
+
+	second := <-calls
+	require.Equal(t, "staging", second.namespace)
+
+	namespace, allNamespaces := w.Namespace()
+	require.Equal(t, "staging", namespace)
+	require.False(t, allNamespaces)
+
+	cancel()
+	<-done
+}

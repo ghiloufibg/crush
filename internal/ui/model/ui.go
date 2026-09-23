@@ -142,6 +142,39 @@ type shellStreamMsg struct {
 	streamCh  <-chan string // unexported; used to continue draining
 }
 
+// podLogsLineMsg carries one line of output from a live pod-log view
+// (kubectl logs -f), delivered via a self-perpetuating tea.Cmd loop that
+// mirrors shellStreamMsg. Namespace/Name identify which pod the line
+// belongs to, so a stream that outlives its dialog (e.g. briefly, after
+// the user closes it and opens a different pod's logs) can be told apart
+// from the currently open dialog rather than misapplied to it.
+type podLogsLineMsg struct {
+	Namespace string
+	Name      string
+	Line      string
+	streamCh  <-chan string // unexported; used to continue draining
+}
+
+// podLogsDoneMsg is sent when a pod's log stream ends, whether because the
+// dialog was closed (context cancelled), kubectl exited, or an error
+// occurred (e.g. ErrLogStreamingUnsupported in client/remote mode).
+type podLogsDoneMsg struct {
+	Namespace string
+	Name      string
+	Err       error
+}
+
+// namespacesLoadedMsg carries the result of an async K8sListNamespaces call
+// started by startNamespacesLoad, along with the panels' namespace scope at
+// the time of the call, so the Namespaces dialog can be opened with the
+// right item pre-selected.
+type namespacesLoadedMsg struct {
+	Namespaces          []string
+	CurrentNamespace    string
+	CurrentAllNamespace bool
+	Err                 error
+}
+
 type (
 	// cancelTimerExpiredMsg is sent when the cancel timer expires.
 	cancelTimerExpiredMsg struct{}
@@ -1072,6 +1105,9 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if podsDialog, ok := m.dialog.Dialog(dialog.PodsID).(*dialog.Pods); ok {
 			podsDialog.SetPods(msg.Payload)
 		}
+		if deploymentPodsDialog, ok := m.dialog.Dialog(dialog.DeploymentPodsID).(*dialog.DeploymentPods); ok {
+			deploymentPodsDialog.SetAllPods(msg.Payload)
+		}
 	case pubsub.Event[[]k8s.Deployment]:
 		m.lastKnownDeployments = msg.Payload
 		if deploymentsDialog, ok := m.dialog.Dialog(dialog.DeploymentsID).(*dialog.Deployments); ok {
@@ -1470,6 +1506,34 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chat.ScrollToBottom()
 		}
 		cmds = append(cmds, m.loadPromptHistory())
+	case podLogsLineMsg:
+		if d, ok := m.dialog.Dialog(dialog.PodLogsID).(*dialog.PodLogs); ok &&
+			d.Namespace() == msg.Namespace && d.Name() == msg.Name {
+			d.AppendLine(msg.Line)
+		}
+		// Continue draining the stream channel.
+		if msg.streamCh != nil {
+			ch := msg.streamCh
+			namespace, name := msg.Namespace, msg.Name
+			cmds = append(cmds, func() tea.Msg {
+				line, ok := <-ch
+				if !ok {
+					return nil
+				}
+				return podLogsLineMsg{Namespace: namespace, Name: name, Line: line, streamCh: ch}
+			})
+		}
+	case podLogsDoneMsg:
+		if d, ok := m.dialog.Dialog(dialog.PodLogsID).(*dialog.PodLogs); ok &&
+			d.Namespace() == msg.Namespace && d.Name() == msg.Name {
+			d.SetStopped(msg.Err)
+		}
+	case namespacesLoadedMsg:
+		if msg.Err != nil {
+			cmds = append(cmds, util.ReportError(msg.Err))
+			break
+		}
+		m.dialog.OpenDialog(dialog.NewNamespaces(m.com, msg.Namespaces, msg.CurrentNamespace, msg.CurrentAllNamespace))
 	case hyperRefreshDoneMsg:
 		if cmd := m.handleSelectModel(msg.action); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -2055,6 +2119,19 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 			defer fimage.ResetCache()
 		}
 
+		// Release whichever watcher the closing dialog was holding.
+		// DialogLast must be inspected before CloseFrontDialog removes it,
+		// since this generic path has no other way to know which dialog ID
+		// is being closed by Escape.
+		if front := m.dialog.DialogLast(); front != nil {
+			switch front.ID() {
+			case dialog.PodsID, dialog.DeploymentPodsID:
+				m.com.Workspace.K8sReleasePodWatcher()
+			case dialog.DeploymentsID:
+				m.com.Workspace.K8sReleaseDeploymentWatcher()
+			}
+		}
+
 		m.dialog.CloseFrontDialog()
 
 		if isOnboarding {
@@ -2549,6 +2626,39 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 	case dialog.ActionScaleDeployment:
 		content := fmt.Sprintf("Scale the deployment %q in namespace %q to %d replicas using k8s_scale_deployment.", msg.Name, msg.Namespace, msg.Replicas)
 		cmds = append(cmds, m.sendMessage(content))
+	case dialog.ActionViewDeploymentPods:
+		// Answered entirely from the pod snapshot the UI already has — no
+		// agent round trip, unlike delete/scale. If a drill-down panel for
+		// a different deployment is already open, replace it rather than
+		// stacking two of the same dialog ID. DeploymentPods depends on
+		// podWatcher (it's seeded from and live-updated by the same pod
+		// snapshot as the Pods dialog), so it acquires/releases that
+		// watcher exactly like Pods does, independently of whether Pods
+		// itself is currently open.
+		if m.dialog.ContainsDialog(dialog.DeploymentPodsID) {
+			m.dialog.CloseDialog(dialog.DeploymentPodsID)
+			m.com.Workspace.K8sReleasePodWatcher()
+		}
+		m.com.Workspace.K8sAcquirePodWatcher()
+		deploymentPodsDialog := dialog.NewDeploymentPods(m.com, msg.Namespace, msg.Name, msg.Selector, m.lastKnownPods)
+		m.dialog.OpenDialog(deploymentPodsDialog)
+	case dialog.ActionViewPodLogs:
+		cmds = append(cmds, m.startPodLogsStream(msg.Namespace, msg.Name))
+	case dialog.ActionExecPod:
+		m.dialog.CloseDialog(dialog.PodsID)
+		m.com.Workspace.K8sReleasePodWatcher()
+		cmds = append(cmds, m.execIntoPod(msg.Namespace, msg.Name))
+	case dialog.ActionSetNamespace:
+		if err := m.com.Workspace.K8sSetNamespace(msg.Namespace, msg.AllNamespaces); err != nil {
+			cmds = append(cmds, util.ReportError(err))
+		} else {
+			scope := msg.Namespace
+			if msg.AllNamespaces {
+				scope = "all namespaces"
+			}
+			cmds = append(cmds, util.CmdHandler(util.NewInfoMsg("Namespace set to: "+scope)))
+		}
+		m.dialog.CloseDialog(dialog.NamespacesID)
 	case dialog.ActionAttachSkill:
 		m.dialog.CloseFrontDialog()
 		cmds = append(cmds, m.attachSkill(msg.ID, msg.Name))
@@ -2961,6 +3071,9 @@ func (m *UI) handleKeyPressMsg(msg tea.KeyPressMsg) tea.Cmd {
 			if cmd := m.openDeploymentsDialog(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
+			return true
+		case key.Matches(msg, m.keyMap.Namespaces):
+			cmds = append(cmds, m.startNamespacesLoad())
 			return true
 		case key.Matches(msg, m.keyMap.Chat.Details) && m.isCompact:
 			m.detailsOpen = !m.detailsOpen
@@ -5172,6 +5285,90 @@ func (m *UI) runShellCommandInternal(command string, isFirstMessage bool) tea.Cm
 	return tea.Batch(cmds...)
 }
 
+// startPodLogsStream opens a live log dialog for namespace/name and begins
+// streaming via K8sStreamPodLogs. Mirrors the bang-mode shell streaming
+// pattern above (see shellStreamMsg): kubectl output flows through a
+// buffered channel drained by a self-perpetuating tea.Cmd. If a pod-logs
+// dialog is already open, it's cancelled and replaced rather than
+// stacking two streams.
+func (m *UI) startPodLogsStream(namespace, name string) tea.Cmd {
+	if d, ok := m.dialog.Dialog(dialog.PodLogsID).(*dialog.PodLogs); ok {
+		d.Close()
+		m.dialog.CloseDialog(dialog.PodLogsID)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	podLogsDialog := dialog.NewPodLogs(m.com, namespace, name, cancel)
+	m.dialog.OpenDialog(podLogsDialog)
+
+	// Stream output via channel, like the bang-mode shell command above.
+	streamCh := make(chan string, 256)
+	onLine := func(line string) {
+		select {
+		case streamCh <- line:
+		default:
+			// Drop if the UI can't keep up.
+		}
+	}
+
+	cmds := []tea.Cmd{func() tea.Msg {
+		line, ok := <-streamCh
+		if !ok {
+			return nil
+		}
+		return podLogsLineMsg{Namespace: namespace, Name: name, Line: line, streamCh: streamCh}
+	}}
+
+	cmds = append(cmds, func() tea.Msg {
+		err := m.com.Workspace.K8sStreamPodLogs(ctx, namespace, name, onLine)
+		close(streamCh)
+		if errors.Is(err, context.Canceled) {
+			err = nil
+		}
+		return podLogsDoneMsg{Namespace: namespace, Name: name, Err: err}
+	})
+
+	return tea.Batch(cmds...)
+}
+
+// startNamespacesLoad fetches the live cluster namespace list, along with
+// the panels' current namespace scope, and returns a namespacesLoadedMsg
+// for the Update loop to open the Namespaces dialog with. Fetching the
+// namespace list is a one-shot call (unlike the streaming pattern above),
+// so this doesn't need a self-perpetuating tea.Cmd loop.
+func (m *UI) startNamespacesLoad() tea.Cmd {
+	return func() tea.Msg {
+		namespaces, err := m.com.Workspace.K8sListNamespaces(context.Background())
+		if err != nil {
+			return namespacesLoadedMsg{Err: err}
+		}
+		currentNamespace, currentAllNamespaces := m.com.Workspace.K8sNamespace()
+		return namespacesLoadedMsg{
+			Namespaces:          namespaces,
+			CurrentNamespace:    currentNamespace,
+			CurrentAllNamespace: currentAllNamespaces,
+		}
+	}
+}
+
+// execIntoPod suspends the TUI and hands the terminal directly to `kubectl
+// exec -it`, resuming when the shell exits. It mirrors openEditor's
+// $EDITOR handoff via tea.ExecProcess, extended from a one-shot text editor
+// to a long-lived interactive shell — the bidirectional, raw-mode
+// counterpart to startPodLogsStream's one-directional output capture.
+func (m *UI) execIntoPod(namespace, name string) tea.Cmd {
+	cmd, err := m.com.Workspace.K8sExecPodCommand(namespace, name)
+	if err != nil {
+		return util.ReportError(err)
+	}
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		if err != nil {
+			return util.ReportError(fmt.Errorf("kubectl exec into %s/%s: %w", namespace, name, err))()
+		}
+		return nil
+	})
+}
+
 const cancelTimerDuration = 2 * time.Second
 
 // cancelTimerCmd creates a command that expires the cancel timer.
@@ -5385,6 +5582,10 @@ func (m *UI) openPodsDialog() tea.Cmd {
 		return nil
 	}
 
+	// Acquire only on an actual open, not a bring-to-front, so re-selecting
+	// an already-open Pods dialog doesn't double-count against
+	// DeploymentPods' independent acquire of the same watcher.
+	m.com.Workspace.K8sAcquirePodWatcher()
 	podsDialog := dialog.NewPods(m.com, m.lastKnownPods)
 	m.dialog.OpenDialog(podsDialog)
 	return nil
@@ -5399,6 +5600,7 @@ func (m *UI) openDeploymentsDialog() tea.Cmd {
 		return nil
 	}
 
+	m.com.Workspace.K8sAcquireDeploymentWatcher()
 	deploymentsDialog := dialog.NewDeployments(m.com, m.lastKnownDeployments)
 	m.dialog.OpenDialog(deploymentsDialog)
 	return nil

@@ -7,6 +7,7 @@ package workspace
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -233,10 +234,84 @@ type Workspace interface {
 	MCPPendingAuth() []mcptools.PendingAuthServer
 	MCPAuthURL(name string) string
 
+	// Kubernetes
+	//
+	// K8sStreamPodLogs streams logs for the given pod, invoking onLine
+	// once per line as it arrives. It blocks until ctx is cancelled or
+	// the stream ends. Unlike the Pods/Deployments panels' data (which
+	// rides the generic pubsub event pipeline set up once at app
+	// startup), starting a log stream is a UI-triggered, on-demand
+	// action, so it goes through Workspace like everything else a
+	// frontend action initiates. Not every implementation can honor
+	// this: see ErrLogStreamingUnsupported.
+	K8sStreamPodLogs(ctx context.Context, namespace, name string, onLine func(string)) error
+
+	// K8sListNamespaces lists the cluster's namespace names.
+	K8sListNamespaces(ctx context.Context) ([]string, error)
+
+	// K8sSetNamespace retargets the Pods/Deployments panels' already-running
+	// watchers at namespace (or every namespace, when allNamespaces is
+	// true). Like K8sStreamPodLogs, this is a UI-triggered, on-demand
+	// action, so it goes through Workspace rather than the generic pubsub
+	// pipeline. It is a pure TUI display-scope change, not a cluster
+	// mutation, so it never goes through the agent. Not every
+	// implementation can honor this: see ErrNamespaceSwitchUnsupported.
+	K8sSetNamespace(namespace string, allNamespaces bool) error
+
+	// K8sNamespace reports the Pods/Deployments panels' current namespace
+	// scope.
+	K8sNamespace() (namespace string, allNamespaces bool)
+
+	// K8sExecPodCommand builds the local `kubectl exec -it` command for an
+	// interactive shell into a pod, for the caller to hand directly to the
+	// terminal (e.g. via tea.ExecProcess). Unlike K8sStreamPodLogs, this
+	// cannot be proxied over RPC even in principle: a raw PTY handoff only
+	// makes sense when the TUI process itself has direct terminal and
+	// kubectl access. Not every implementation can honor this: see
+	// ErrExecUnsupported.
+	K8sExecPodCommand(namespace, name string) (*exec.Cmd, error)
+
+	// K8sAcquirePodWatcher/K8sReleasePodWatcher and
+	// K8sAcquireDeploymentWatcher/K8sReleaseDeploymentWatcher mark a
+	// panel that reads pod or deployment snapshots (Pods, Deployments,
+	// or the DeploymentPods drill-down) as visible or no longer visible,
+	// so the underlying watcher's poll loop only runs while something is
+	// actually displaying its data. Calls are reference-counted and must
+	// be paired by the caller; an unpaired release is a no-op. These are
+	// a pure local performance optimization, not a cluster mutation or a
+	// display-scope change, so unlike K8sSetNamespace there is nothing
+	// for a workspace implementation to fail at: implementations that
+	// cannot control watcher lifecycle remotely (see [ClientWorkspace])
+	// simply no-op, leaving the server-side watcher running continuously
+	// as it always has.
+	K8sAcquirePodWatcher()
+	K8sReleasePodWatcher()
+	K8sAcquireDeploymentWatcher()
+	K8sReleaseDeploymentWatcher()
+
 	// Events
 	Subscribe(program *tea.Program)
 	Shutdown()
 }
+
+// ErrLogStreamingUnsupported is returned by K8sStreamPodLogs
+// implementations that cannot honor live streaming (currently
+// [ClientWorkspace], which has no remote-log-streaming RPC in this spike).
+// Callers should surface it as a clear, immediate error rather than
+// leaving the caller waiting for lines that will never arrive.
+var ErrLogStreamingUnsupported = errors.New("log streaming is not supported for this workspace")
+
+// ErrNamespaceSwitchUnsupported is returned by K8sSetNamespace
+// implementations that cannot honor runtime namespace switching (currently
+// [ClientWorkspace], which has no remote watcher-reconfiguration RPC in
+// this spike).
+var ErrNamespaceSwitchUnsupported = errors.New("namespace switching is not supported for this workspace")
+
+// ErrExecUnsupported is returned by K8sExecPodCommand implementations that
+// cannot honor an interactive pod shell (currently [ClientWorkspace]: a raw
+// PTY handoff has no remote equivalent in this spike, unlike streaming
+// output over RPC).
+var ErrExecUnsupported = errors.New("exec is not supported for this workspace")
 
 // MCPResourceContents holds the contents of an MCP resource.
 type MCPResourceContents struct {

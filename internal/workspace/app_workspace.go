@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/crush/internal/commands"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/history"
+	"github.com/charmbracelet/crush/internal/k8s"
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/oauth"
@@ -491,6 +493,45 @@ func (w *AppWorkspace) MCPPendingAuth() []mcptools.PendingAuthServer {
 
 func (w *AppWorkspace) MCPAuthURL(name string) string {
 	return mcptools.MCPAuthURL(name)
+}
+
+// -- Kubernetes --
+
+func (w *AppWorkspace) K8sStreamPodLogs(ctx context.Context, namespace, name string, onLine func(string)) error {
+	return k8s.StreamPodLogs(ctx, namespace, name, onLine)
+}
+
+func (w *AppWorkspace) K8sListNamespaces(ctx context.Context) ([]string, error) {
+	return k8s.ListNamespaces(ctx)
+}
+
+func (w *AppWorkspace) K8sSetNamespace(namespace string, allNamespaces bool) error {
+	w.app.SetK8sNamespace(namespace, allNamespaces)
+	return nil
+}
+
+func (w *AppWorkspace) K8sNamespace() (namespace string, allNamespaces bool) {
+	return w.app.K8sNamespace()
+}
+
+func (w *AppWorkspace) K8sExecPodCommand(namespace, name string) (*exec.Cmd, error) {
+	return k8s.ExecPodCommand(namespace, name), nil
+}
+
+func (w *AppWorkspace) K8sAcquirePodWatcher() {
+	w.app.AcquireK8sPodWatcher()
+}
+
+func (w *AppWorkspace) K8sReleasePodWatcher() {
+	w.app.ReleaseK8sPodWatcher()
+}
+
+func (w *AppWorkspace) K8sAcquireDeploymentWatcher() {
+	w.app.AcquireK8sDeploymentWatcher()
+}
+
+func (w *AppWorkspace) K8sReleaseDeploymentWatcher() {
+	w.app.ReleaseK8sDeploymentWatcher()
 }
 
 // -- Lifecycle --

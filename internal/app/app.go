@@ -91,13 +91,60 @@ type App struct {
 	herdrClient *herdr.Client
 
 	// podWatcher polls the current kubeconfig context for pod state and
-	// publishes snapshots for the Pods panel. Its Run loop is started
-	// against app.eventsCtx, so it stops the same way every other
-	// service subscription does on shutdown.
-	podWatcher *k8s.Watcher
+	// publishes snapshots for the Pods panel. Unlike most other
+	// subscriptions, its poll loop (Run) is not started for the whole
+	// App lifetime: podWatcherLifecycle starts and stops it on demand,
+	// tied to whether a panel that needs pod data is actually visible.
+	podWatcher          *k8s.Watcher
+	podWatcherLifecycle k8sWatcherLifecycle
 
 	// deploymentWatcher mirrors podWatcher for the Deployments panel.
-	deploymentWatcher *k8s.DeploymentWatcher
+	deploymentWatcher          *k8s.DeploymentWatcher
+	deploymentWatcherLifecycle k8sWatcherLifecycle
+}
+
+// k8sWatcherLifecycle reference-counts concurrent viewers of a Kubernetes
+// watcher (e.g. the Pods dialog and the DeploymentPods drill-down both need
+// podWatcher running at once) and starts/stops its poll loop accordingly,
+// so it only shells out to kubectl while at least one TUI panel is actually
+// displaying its data. See the "watcher lifecycle tied to dialog
+// visibility" decision in claudedocs/experimentation-session-3-design.md.
+// Acquire and release calls must be paired by the caller; an unpaired
+// release is a no-op rather than going negative.
+type k8sWatcherLifecycle struct {
+	mu     sync.Mutex
+	refs   int
+	cancel context.CancelFunc
+}
+
+// acquire starts run in a new goroutine, under a context derived from
+// parent, the first time the ref count goes from 0 to 1. Later calls just
+// bump the count without starting a second copy of run.
+func (l *k8sWatcherLifecycle) acquire(parent context.Context, run func(context.Context)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.refs++
+	if l.refs > 1 {
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	l.cancel = cancel
+	go run(ctx)
+}
+
+// release drops the ref count, stopping run once the last viewer releases
+// it. A release with no matching acquire is a no-op.
+func (l *k8sWatcherLifecycle) release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.refs == 0 {
+		return
+	}
+	l.refs--
+	if l.refs == 0 && l.cancel != nil {
+		l.cancel()
+		l.cancel = nil
+	}
 }
 
 // New initializes a new application instance. skillsMgr carries the
@@ -145,11 +192,10 @@ func New(ctx context.Context, conn *sql.DB, store *config.ConfigStore, skillsMgr
 
 	app.setupEvents()
 
-	// Start polling for pod state in the background. Tied to eventsCtx
-	// (set up by setupEvents above) so it stops on the same shutdown path
-	// as every other service subscription.
-	go app.podWatcher.Run(app.eventsCtx)
-	go app.deploymentWatcher.Run(app.eventsCtx)
+	// podWatcher and deploymentWatcher are deliberately not started here.
+	// Their poll loops only run while something is actually displaying
+	// their data — see AcquireK8sPodWatcher/AcquireK8sDeploymentWatcher,
+	// called from the Pods/Deployments/DeploymentPods dialog open paths.
 
 	// Initialize clipboard support. This is best-effort; if it fails
 	// (e.g., headless environment), clipboard operations will return nil.
@@ -242,6 +288,47 @@ func (app *App) AgentNotifications() *pubsub.Broker[notify.Notification] {
 // coordinator could publish one of its own.
 func (app *App) RunCompletions() *pubsub.Broker[notify.RunComplete] {
 	return app.runCompletions
+}
+
+// SetK8sNamespace retargets both the Pods and Deployments panels' watchers
+// at namespace (or every namespace, when allNamespaces is true), without
+// restarting them. This is a pure TUI display-scope change: it does not
+// touch the cluster, so it goes straight through App rather than the agent.
+func (app *App) SetK8sNamespace(namespace string, allNamespaces bool) {
+	app.podWatcher.SetNamespace(namespace, allNamespaces)
+	app.deploymentWatcher.SetNamespace(namespace, allNamespaces)
+}
+
+// K8sNamespace reports the Pods/Deployments panels' current namespace
+// scope. podWatcher and deploymentWatcher are always kept in sync by
+// SetK8sNamespace, so reading either alone is representative of both.
+func (app *App) K8sNamespace() (namespace string, allNamespaces bool) {
+	return app.podWatcher.Namespace()
+}
+
+// AcquireK8sPodWatcher marks a viewer of pod data (the Pods dialog, or a
+// DeploymentPods drill-down) as active, starting podWatcher's poll loop on
+// the first concurrent viewer. Must be paired with ReleaseK8sPodWatcher
+// when that viewer closes.
+func (app *App) AcquireK8sPodWatcher() {
+	app.podWatcherLifecycle.acquire(app.eventsCtx, app.podWatcher.Run)
+}
+
+// ReleaseK8sPodWatcher pairs with AcquireK8sPodWatcher, stopping
+// podWatcher's poll loop once the last viewer releases it.
+func (app *App) ReleaseK8sPodWatcher() {
+	app.podWatcherLifecycle.release()
+}
+
+// AcquireK8sDeploymentWatcher mirrors AcquireK8sPodWatcher for the
+// Deployments dialog.
+func (app *App) AcquireK8sDeploymentWatcher() {
+	app.deploymentWatcherLifecycle.acquire(app.eventsCtx, app.deploymentWatcher.Run)
+}
+
+// ReleaseK8sDeploymentWatcher pairs with AcquireK8sDeploymentWatcher.
+func (app *App) ReleaseK8sDeploymentWatcher() {
+	app.deploymentWatcherLifecycle.release()
 }
 
 // ReportCurrentSession tells herdr which session the user is now

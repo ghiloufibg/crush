@@ -67,6 +67,49 @@ type ActionScaleDeployment struct {
 	Replicas  int
 }
 
+// ActionViewDeploymentPods is a message indicating the user wants to drill
+// down from a deployment to the pods it owns. Unlike the other Deployment
+// actions, this never reaches the agent — it's answered entirely from
+// data the UI already has (the most recent pod snapshot, filtered by
+// Selector), so the handler opens a dialog directly rather than sending a
+// chat message.
+type ActionViewDeploymentPods struct {
+	Namespace string
+	Name      string
+	Selector  map[string]string
+}
+
+// ActionViewPodLogs is a message indicating the user wants to open a live,
+// streaming view of a pod's logs. Like ActionViewDeploymentPods, this
+// bypasses the agent entirely: the handler opens a dialog and starts
+// K8sStreamPodLogs directly, since there's no mutation to permission-gate.
+type ActionViewPodLogs struct {
+	Namespace string
+	Name      string
+}
+
+// ActionExecPod is a message indicating the user wants an interactive
+// shell into a pod, via `kubectl exec -it`. Like ActionViewPodLogs, this
+// bypasses the agent entirely — there's no mutation to permission-gate,
+// only a raw terminal handoff. Unlike every other dialog action, its
+// handler suspends the TUI itself (see UI.execIntoPod) rather than
+// opening another dialog or sending a chat message.
+type ActionExecPod struct {
+	Namespace string
+	Name      string
+}
+
+// ActionSetNamespace is a message indicating the user has chosen a
+// namespace scope for the Pods/Deployments panels. Like
+// ActionViewDeploymentPods, this bypasses the agent entirely: it's a pure
+// TUI display-scope change, not a cluster mutation, so the handler calls
+// Workspace.K8sSetNamespace directly rather than sending a chat message.
+// AllNamespaces true means "every namespace" and Namespace is ignored.
+type ActionSetNamespace struct {
+	Namespace     string
+	AllNamespaces bool
+}
+
 // ActionSelectModel is a message indicating a model has been selected.
 type ActionSelectModel struct {
 	Provider       catwalk.Provider

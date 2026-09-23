@@ -1,1 +1,3 @@
 List Kubernetes deployments via `kubectl get deployments`. Returns namespace, name, ready replica count, up-to-date replica count, and available replica count for each deployment, sorted by namespace then name. Defaults to the current kubeconfig context's namespace; set all_namespaces to list across the whole cluster.
+
+Results are capped at 50 by default (see max_results). To narrow scope instead of raising the cap, prefer label_selector (filtered by kubectl itself, cheapest) or name_contains (filtered after fetching). If the response was truncated, it says how many more deployments matched so you know the cluster wasn't fully listed.
